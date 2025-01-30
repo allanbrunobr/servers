@@ -1,12 +1,22 @@
 import { z } from "zod";
 import { makeRequest } from "../common/utils.js";
 
-// Esquema de entrada para busca de arquivos duplicados
 export const GetDuplicationsSchema = z.object({
     projectKey: z.string().describe("The project key in SonarQube"),
 });
 
-// Esquema da resposta da API de duplicações
+type FileInfo = {
+    key: string;
+    path: string;
+};
+
+type ComponentsResponse = {
+    components: Array<{
+        key: string;
+        path: string;
+    }>;
+};
+
 export const DuplicationSchema = z.object({
     duplications: z.array(
         z.object({
@@ -29,24 +39,20 @@ export const DuplicationSchema = z.object({
     ),
 });
 
-// Obter lista de arquivos no projeto
-export async function listFiles(projectKey: string) {
-    const response = await makeRequest(`/api/components/tree?component=${projectKey}&qualifiers=FIL`);
+export async function listFiles(projectKey: string): Promise<FileInfo[]> {
+    const response = await makeRequest<ComponentsResponse>(`/api/components/tree?component=${projectKey}&qualifiers=FIL`);
 
-    return response.components.map((file: any) => ({
+    return response.components.map(file => ({
         key: file.key,
         path: file.path,
     }));
 }
 
-// Obter duplicações para um arquivo específico
 export async function getFileDuplications(fileKey: string) {
     const response = await makeRequest(`/api/duplications/show?key=${fileKey}`);
-
     return DuplicationSchema.parse(response);
 }
 
-// Obter duplicações para todos os arquivos do projeto
 export async function getProjectDuplications(params: z.infer<typeof GetDuplicationsSchema>) {
     const fileKeys = await listFiles(params.projectKey);
     const duplications = [];

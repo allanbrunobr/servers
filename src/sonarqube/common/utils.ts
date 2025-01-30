@@ -1,7 +1,7 @@
 import fetch, { RequestInit } from 'node-fetch';
 import { SonarQubeError, SonarQubeAuthenticationError } from './errors.js';
 
-export async function makeRequest(path: string, options: Partial<RequestInit> = {}) {
+export async function makeRequest<T = any>(path: string, options: Partial<RequestInit> = {}): Promise<T> {
     const token = process.env.SONAR_TOKEN; //squ_1e561d0625bd940066f08dc91357bd94662416e7
     const baseUrl = process.env.SONAR_URL || 'http://localhost:9000';
 
