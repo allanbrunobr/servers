@@ -14,6 +14,8 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { diffLines, createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -146,6 +148,13 @@ const GetFileInfoArgsSchema = z.object({
   path: z.string(),
 });
 
+const ExecuteFileArgsSchema = z.object({
+  path: z.string(),
+  args: z.array(z.string()).optional().default([]),
+  timeoutMs: z.number().optional().default(30000),
+  command: z.enum(['python', 'python3', 'node', 'npm', 'pip']).optional(),
+});
+
 const ToolInputSchema = ToolSchema.shape.inputSchema;
 type ToolInput = z.infer<typeof ToolInputSchema>;
 
@@ -254,7 +263,7 @@ function createUnifiedDiff(originalContent: string, newContent: string, filepath
 
 async function applyFileEdits(
   filePath: string,
-  edits: Array<{oldText: string, newText: string}>,
+  edits: Array<{ oldText: string, newText: string }>,
   dryRun = false
 ): Promise<string> {
   // Read file content and normalize line endings
@@ -330,7 +339,10 @@ async function applyFileEdits(
   return formattedDiff;
 }
 
-// Tool handlers
+const execAsync = promisify(exec);
+
+const PYTHON_COMMANDS = ['python3', 'python', 'py'];
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
@@ -390,10 +402,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "directory_tree",
         description:
-            "Get a recursive tree view of files and directories as a JSON structure. " +
-            "Each entry includes 'name', 'type' (file/directory), and 'children' for directories. " +
-            "Files have no children array, while directories always have a children array (which may be empty). " +
-            "The output is formatted with 2-space indentation for readability. Only works within allowed directories.",
+          "Get a recursive tree view of files and directories as a JSON structure. " +
+          "Each entry includes 'name', 'type' (file/directory), and 'children' for directories. " +
+          "Files have no children array, while directories always have a children array (which may be empty). " +
+          "The output is formatted with 2-space indentation for readability. Only works within allowed directories.",
         inputSchema: zodToJsonSchema(DirectoryTreeArgsSchema) as ToolInput,
       },
       {
@@ -435,6 +447,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: [],
         },
       },
+      {
+        name: "execute_file",
+        description:
+          "Execute a file (Python, Node.js, or other executable) and capture its output. " +
+          "Supports command line arguments and has a configurable timeout. " +
+          "Returns both stdout and stderr. Only works within allowed directories. " +
+          "Timeout defaults to 30 seconds.",
+        inputSchema: zodToJsonSchema(ExecuteFileArgsSchema) as ToolInput,
+      },
     ],
   };
 });
@@ -443,6 +464,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const { name, arguments: args } = request.params;
+
+    let cmd = ''; // Initialize cmd
 
     switch (name) {
       case "read_file": {
@@ -530,48 +553,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-        case "directory_tree": {
-            const parsed = DirectoryTreeArgsSchema.safeParse(args);
-            if (!parsed.success) {
-                throw new Error(`Invalid arguments for directory_tree: ${parsed.error}`);
-            }
-
-            interface TreeEntry {
-                name: string;
-                type: 'file' | 'directory';
-                children?: TreeEntry[];
-            }
-
-            async function buildTree(currentPath: string): Promise<TreeEntry[]> {
-                const validPath = await validatePath(currentPath);
-                const entries = await fs.readdir(validPath, {withFileTypes: true});
-                const result: TreeEntry[] = [];
-
-                for (const entry of entries) {
-                    const entryData: TreeEntry = {
-                        name: entry.name,
-                        type: entry.isDirectory() ? 'directory' : 'file'
-                    };
-
-                    if (entry.isDirectory()) {
-                        const subPath = path.join(currentPath, entry.name);
-                        entryData.children = await buildTree(subPath);
-                    }
-
-                    result.push(entryData);
-                }
-
-                return result;
-            }
-
-            const treeData = await buildTree(parsed.data.path);
-            return {
-                content: [{
-                    type: "text",
-                    text: JSON.stringify(treeData, null, 2)
-                }],
-            };
+      case "directory_tree": {
+        const parsed = DirectoryTreeArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for directory_tree: ${parsed.error}`);
         }
+
+        interface TreeEntry {
+          name: string;
+          type: 'file' | 'directory';
+          children?: TreeEntry[];
+        }
+
+        async function buildTree(currentPath: string): Promise<TreeEntry[]> {
+          const validPath = await validatePath(currentPath);
+          const entries = await fs.readdir(validPath, { withFileTypes: true });
+          const result: TreeEntry[] = [];
+
+          for (const entry of entries) {
+            const entryData: TreeEntry = {
+              name: entry.name,
+              type: entry.isDirectory() ? 'directory' : 'file'
+            };
+
+            if (entry.isDirectory()) {
+              const subPath = path.join(currentPath, entry.name);
+              entryData.children = await buildTree(subPath);
+            }
+
+            result.push(entryData);
+          }
+
+          return result;
+        }
+
+        const treeData = await buildTree(parsed.data.path);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(treeData, null, 2)
+          }],
+        };
+      }
 
       case "move_file": {
         const parsed = MoveFileArgsSchema.safeParse(args);
@@ -606,9 +629,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const validPath = await validatePath(parsed.data.path);
         const info = await getFileStats(validPath);
         return {
-          content: [{ type: "text", text: Object.entries(info)
-            .map(([key, value]) => `${key}: ${value}`)
-            .join("\n") }],
+          content: [{
+            type: "text", text: Object.entries(info)
+              .map(([key, value]) => `${key}: ${value}`)
+              .join("\n")
+          }],
         };
       }
 
@@ -619,6 +644,114 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: `Allowed directories:\n${allowedDirectories.join('\n')}`
           }],
         };
+      }
+
+      case "execute_file": {
+        const parsed = ExecuteFileArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for execute_file: ${parsed.error}`);
+        }
+
+        const validPath = await validatePath(parsed.data.path);
+        const ext = path.extname(validPath).toLowerCase();
+
+        let cmd = ''; // Initialize cmd
+
+        // If specific command is provided, use it directly
+        if (parsed.data.command) {
+          switch (parsed.data.command) {
+            case 'npm':
+              cmd = `npm --prefix "${path.dirname(validPath)}"`;
+              break;
+            case 'pip':
+              cmd = `pip`;
+              break;
+            case 'python':
+              cmd = 'python';
+              break;
+            case 'python3':
+              cmd = 'python3';
+              break;
+            case 'node':
+              cmd = 'node';
+              break;
+          }
+        } else {
+          // Original file extension based logic
+          switch (ext) {
+            case '.py': {
+              // Try different Python commands until one works
+              let pythonError = '';
+              for (const pythonCmd of PYTHON_COMMANDS) {
+                try {
+                  // Test if the Python command exists
+                  await execAsync(`${pythonCmd} --version`);
+                  cmd = `${pythonCmd} "${validPath}"`;
+                  pythonError = ''; // Clear error if command succeeds
+                  break;
+                } catch (error) {
+                  pythonError = `No working Python command found. Tried: ${PYTHON_COMMANDS.join(', ')}`;
+                  continue;
+                }
+              }
+              if (pythonError) {
+                throw new Error(pythonError);
+              }
+              break;
+            }
+            case '.js':
+              cmd = `node "${validPath}"`;
+              break;
+            case '.ts':
+              cmd = `ts-node "${validPath}"`;
+              break;
+            case '.sh':
+              cmd = `bash "${validPath}"`;
+              break;
+            default:
+              // For other files, try to execute directly if they have execute permissions
+              const stats = await fs.stat(validPath);
+              const isExecutable = !!(stats.mode & 0o111); // Check if file has execute permission
+              if (!isExecutable) {
+                throw new Error(`File ${parsed.data.path} is not executable and has unknown extension`);
+              }
+              cmd = `"${validPath}"`;
+          }
+        }
+
+        if (!cmd) {
+          throw new Error(`Could not determine how to execute file/command: ${validPath}`);
+        }
+
+        // For specific commands, we might not need the file path in the command
+        if (!['npm', 'pip'].includes(parsed.data.command || '')) {
+          cmd += ` "${validPath}"`;
+        }
+
+        if (parsed.data.args.length > 0) {
+          cmd += ' ' + parsed.data.args.map(arg => `"${arg}"`).join(' ');
+        }
+
+        try {
+          const { stdout, stderr } = await execAsync(cmd, {
+            timeout: parsed.data.timeoutMs,
+            cwd: path.dirname(validPath)
+          });
+
+          return {
+            content: [{
+              type: "text",
+              text: `=== STDOUT ===\n${stdout}\n=== STDERR ===\n${stderr}`
+            }],
+          };
+        } catch (error) {
+          if (error instanceof Error) {
+            const execError = error as any;
+            const errorMessage = `Execution failed:\n${execError.message}\n\nStdout: ${execError.stdout || ''}\nStderr: ${execError.stderr || ''}`;
+            throw new Error(errorMessage);
+          }
+          throw error;
+        }
       }
 
       default:
